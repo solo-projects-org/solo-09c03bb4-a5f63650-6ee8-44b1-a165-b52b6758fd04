@@ -7,3 +7,4 @@ tests
 .env
 .gitignore
 README.md
+data

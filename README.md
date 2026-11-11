@@ -1,14 +1,29 @@
-# 医院计数矩阵遮盖核查 API
+# 院区病例入仓日量告警 API
 
-发布分年龄组（列）、乡镇（行）的病例计数前，用本服务检查 `null` 遮盖格
-能否被**公开的行/列合计精确反推**。对每个隐藏格，在所有合计同时成立的
-前提下返回：
+院区病例底表入仓行数突然变少时，值班员需要快速判断是否存在漏载。本服务按
+**院区 + 采样日**维护入仓行数，并基于同星期几的历史日量自动判定异常、维护
+告警状态，支持补报、更正与撤回后的增量重判。
 
-- 可行最小值 `min`、最大值 `max`（隐藏值可取任意非负整数）；
-- 分别达到两界的完整可行矩阵 `minimizer_matrix` / `maximizer_matrix`；
-- `min == max` 时标记 `recoverable: true`，表示该格可被唯一反推，
-  工程师应调整遮盖位置后重新核查；
-- 约束无解时返回 HTTP 409 与结构化冲突说明，**不输出任何区间**。
+## 判定规则
+
+对某院区的采样日 `d`，**同时满足**以下条件才发出告警：
+
+1. `d` 当天已收齐（行数不为 `null`）；
+2. 本院区、与 `d` **同星期几**、且**早于 `d`** 的已收齐采样日中，最近的
+   4 个构成基准；不足 4 个时不判定、不告警；
+3. `d` 的行数**严格低于**这 4 个基准行数中位数的一半。
+
+约定与细节：
+
+- 行数为**非负整数**；未收齐填 `null`，收齐但没有记录填 `0`（`0` 正常参与
+  判定，`null` 不参与任何基准、自身也不判定）。
+- 4 个数的中位数为排序后中间两数之和除以 2。实现全程整数运算：记中间两数
+  之和为 `median_num`，判定式为 `4 * row_count < median_num`，无浮点误差。
+- 同批日期不允许重复；同一天的新数据覆盖旧值（含撤回为 `null`）。
+- 补报、更正或撤回后，只重判**改动日**与**基准可能被它影响的后续同星期几
+  日期**：改动日与某后续日之间已有 4 个已收齐日时，改动日不可能再进入后者
+  的基准，遍历即停止；未收齐日不占用该计数，但本身仍会重判。
+- 不同院区数据完全隔离。
 
 ## 目录结构
 
@@ -16,10 +31,11 @@
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py        # FastAPI 应用与路由（含 Swagger 示例）
-│   ├── schemas.py     # Pydantic 请求/响应模型、4 个内置示例
-│   └── solver.py      # Dinic 最大流可行性判定 + HiGHS 线性规划求界
-├── tests/             # pytest 测试（含暴力枚举交叉验证）
+│   ├── alerts.py        # 纯领域逻辑：中位数、半数阈值、基准选择、重判范围
+│   ├── database.py      # SQLite 表结构、事务、增量重判与告警状态同步
+│   ├── main.py          # FastAPI 路由（含 4 个有序 Swagger 样例）
+│   └── schemas.py       # Pydantic 请求/响应模型与样例数据
+├── tests/               # pytest：领域逻辑、服务层、API、随机交叉验证、并发
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -32,94 +48,116 @@
 docker compose up --build
 ```
 
+SQLite 数据库文件位于容器内 `/data/daily_alert.db`，通过命名卷 `alert-data`
+持久化，重启容器不丢数据；路径可用环境变量 `DAILY_ALERT_DB` 覆盖。
+
 启动后：
 
-- Swagger UI：<http://localhost:8000/docs> （可直接选用内置示例提交）
+- Swagger UI：<http://localhost:8000/docs> （可直接选用内置样例提交）
 - ReDoc：<http://localhost:8000/redoc>
 - 健康检查：<http://localhost:8000/health>
+- 规则说明：<http://localhost:8000/method>
 
-停止：`docker compose down`。
+停止：`docker compose down`（加 `-v` 同时删除数据卷）。
 
-## 请求与响应
+## Swagger 样例演示（先录入日量，再补报旧日）
 
-`POST /api/v1/suppression-check`
+Swagger 的请求体示例按 ① → ② → ③ → ④ 顺序在同一院区提交，可观察完整告警
+生命周期（样例日期均为星期三）：
 
-请求体（矩阵最多 12×12；`null` 为遮盖格，其余为固定非负整数）：
+| 步骤 | 样例 | 内容 | 结果 |
+| --- | --- | --- | --- |
+| ① | `1_initial` | 6 个已收齐日 + 1 个 `null` 未收齐日 | 2026-11-11 行数 90 < 基准中位数 995 的一半，**新增告警** |
+| ② | `2_late_day` | 2026-11-18 收齐为 300 | 300 < 中位数 985 的一半 492.5，**再新增一条告警** |
+| ③ | `3_backfill` | 补报旧日 2026-10-21 = 100 | 11-18 的基准被改写，新中位数 530 的一半为 265，300 不再低于它，**告警解除**；11-11 仍告警（基准同步刷新） |
+| ④ | `4_withdraw` | 撤回 2026-10-21（置 `null`） | 后续基准复原，11-18 重新满足条件，**再次新增告警** |
+
+也可用 curl 复现（以第 ① 步为例）：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/daily-counts/batch \
+  -H "Content-Type: application/json" \
+  -d '{"campus":"院区A","entries":[
+    {"sample_date":"2026-09-30","row_count":1000},
+    {"sample_date":"2026-10-07","row_count":980},
+    {"sample_date":"2026-10-14","row_count":1020},
+    {"sample_date":"2026-10-28","row_count":960},
+    {"sample_date":"2026-11-04","row_count":1010},
+    {"sample_date":"2026-11-11","row_count":90},
+    {"sample_date":"2026-11-18","row_count":null}
+  ]}'
+```
+
+## 接口
+
+### `POST /api/v1/daily-counts/batch`：提交一批日量
+
+请求体：
 
 ```json
 {
-  "matrix": [
-    [5, null, null],
-    [null, 3, null],
-    [null, null, 2]
-  ],
-  "row_totals": [12, 10, 8],
-  "col_totals": [9, 9, 12]
+  "campus": "院区A",
+  "entries": [
+    {"sample_date": "2026-11-11", "row_count": 90},
+    {"sample_date": "2026-11-18", "row_count": null}
+  ]
 }
 ```
 
-可行响应（HTTP 200，节选）：
+响应（新增告警附基准日期与对应行数；另含提交后全部有效告警日期）：
 
 ```json
 {
-  "status": "feasible",
-  "grand_total": 30,
-  "hidden_count": 6,
-  "recoverable_count": 0,
-  "cells": [
-    {"row": 0, "col": 1, "min": 0, "max": 4, "recoverable": false}
+  "campus": "院区A",
+  "received": 7,
+  "raised": [
+    {
+      "sample_date": "2026-11-11",
+      "row_count": 90,
+      "median": 995,
+      "baseline": [
+        {"sample_date": "2026-10-07", "row_count": 980},
+        {"sample_date": "2026-10-14", "row_count": 1020},
+        {"sample_date": "2026-10-28", "row_count": 960},
+        {"sample_date": "2026-11-04", "row_count": 1010}
+      ]
+    }
   ],
-  "minimizer_matrix": [[5, 0, 7], [4, 3, 3], [0, 6, 2]],
-  "maximizer_matrix": [[5, 4, 3], [0, 3, 7], [4, 2, 2]]
+  "resolved": [],
+  "active_alerts": [{"sample_date": "2026-11-11"}]
 }
 ```
 
-无解响应（HTTP 409，不含任何区间信息）：
+- `raised`：本批**新增**告警（提交前不存在、提交后有效），携带基准日期、
+  基准行数与中位数。
+- `resolved`：本批**解除**告警（提交前有效、提交后不再成立）。
+- 持续有效的告警若基准被改写，只静默刷新基准，首次触发时间 `triggered_at`
+  保留，不出现在两个变化列表中。
 
-```json
-{
-  "status": "conflict",
-  "reasons": [
-    "不存在满足全部公开合计的非负整数矩阵：最大流可行性检验未通过",
-    "行子集 [0] 的隐藏格需求合计为 6，但这些行的隐藏格只能进入列 [0]，其可承接供给仅为 2（Hall 条件被破坏：需求 > 邻接供给）",
-    "最大流 6 < 隐藏格所需总流量 10"
-  ],
-  "witness": {
-    "max_flow": 6,
-    "required_flow": 10,
-    "row_subset": [0],
-    "neighbor_cols": [0],
-    "subset_demand": 6,
-    "neighbor_supply": 2
-  }
-}
-```
+### `GET /api/v1/daily-counts?campus=...`
 
-状态码约定：
+查询某院区全部采样日（含 `null` 未收齐日），按日期升序。
+
+### `GET /api/v1/alerts?campus=...`
+
+查询某院区当前全部有效告警，含中位数、基准日期与行数、首次触发时间。
+
+状态码：
 
 | 场景 | 状态码 |
 | --- | --- |
-| 存在可行矩阵 | 200，返回区间与两张完整矩阵 |
-| 合计约束无解（总量不符 / 固定格超限 / Hall 条件破坏） | 409，返回冲突原因与见证 |
-| 请求结构或类型错误（超 12×12、负数、布尔、长度不符） | 422，Pydantic 校验信息 |
+| 批次提交成功 | 200，返回新增/解除告警 |
+| 负数/布尔/浮点行数、同批日期重复、空 entries、空白院区、非法日期 | 422 |
+| 事务执行异常 | 500，整批已回滚，不留部分写入 |
 
-## 算法说明
+## 事务与并发
 
-1. **建模**：每个遮盖格对应一个非负整数变量，行/列合计构成等式约束，
-   即整数运输问题。
-2. **可行性**：运输约束矩阵是全幺模矩阵，右侧为整数，线性规划松弛的
-   顶点天然为整数解。服务先用自实现的 Dinic 最大流判定可行性：
-   source→行（剩余行需求）、隐藏格所在行列之间建容量无限边、列→sink
-   （剩余列供给）。最大流达不到隐藏格总流量即无解，并由最小割给出
-   Hall 型冲突见证（哪些行的需求超出其邻接列供给）。
-3. **求界**：可行时对每个隐藏格分别以该变量系数 +1 / −1 为目标做
-   `scipy.optimize.linprog(method="highs")`，得到 `min` / `max`，
-   并输出取扫描序第一个隐藏格的两张极值完整矩阵。
-4. **复核**：输出矩阵在返回前重新逐行逐列核对公开合计、非负性与整数性。
-5. **可还原判定**：`min == max` 即该格取值唯一，可被公开合计反推。
-
-复杂度：设隐藏格数为 h（h ≤ 144），共 2h+1 次小规模 LP 与一次
-O(V²E) 最大流；12×12 实测在百毫秒内完成。
+- 日量与告警状态在**同一个 SQLite 事务**内提交（`BEGIN IMMEDIATE`）：判定
+  读取、日量 upsert、告警增删全部成功才 `COMMIT`，任何异常整体 `ROLLBACK`。
+- 进程内全局串行锁保证并发批次逐个进入事务；每批返回的新增/解除以它
+  **实际提交前后的状态**为准。SQLite 另启用 WAL 与 `busy_timeout`。
+- 部署为单 uvicorn 进程即可满足串行语义；如需多进程，可改用单写者队列或
+  基于 `SQLITE_BUSY` 的重试。
 
 ## 本地开发（无 Docker 时）
 
@@ -127,10 +165,17 @@ O(V²E) 最大流；12×12 实测在百毫秒内完成。
 python3 -m venv --without-pip .venv
 .venv/bin/python get-pip.py            # 若 ensurepip 不可用
 .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
-.venv/bin/uvicorn app.main:app --reload --port 8000
+DAILY_ALERT_DB=./data/daily_alert.db \
+  .venv/bin/uvicorn app.main:app --reload --port 8000
 .venv/bin/python -m pytest tests -q
 ```
 
-测试集包含 70 组随机小规模问题的**暴力枚举交叉验证**：LP 求出的每个
-区间与枚举全部可行赋值的 min/max 完全一致，并覆盖无解、可还原、
-零矩阵、1×1、12×12 与各类 422/409 场景。
+测试覆盖：
+
+- 领域逻辑：中位数分子、半数阈值边界（含 `x.5` 中位数）、只取最近 4 个基准、
+  重判范围的边界与 `null` 占位；
+- 服务层：完整告警生命周期、`0` 与 `null` 语义、覆盖更正、撤回解除、院区/
+  星期隔离、事务回滚无残留、双线程并发不丢更新；
+- **随机属性测试**：40 轮随机批次（含补报、更正、撤回）后，增量维护的告警
+  与按最终数据从头全量重算的结论逐轮一致；
+- API：4 个 Swagger 样例端到端、422 校验、500 回滚、OpenAPI 示例顺序。

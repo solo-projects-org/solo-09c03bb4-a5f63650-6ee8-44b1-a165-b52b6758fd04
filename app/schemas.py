@@ -1,187 +1,179 @@
-"""请求/响应 Pydantic 模型与 Swagger 示例。"""
+"""请求/响应 Pydantic 模型与 Swagger 样例。
+
+Swagger 中的 4 个样例按顺序提交即可观察完整告警生命周期（样例均为
+院区 A 的星期三数据，weekday 由日期本身决定）：
+
+1. ``initial``：录入 6 个已收齐采样日 + 1 个未收齐日（null），
+   2026-11-11 行数 90 低于最近 4 个同星期几中位数（995）的一半，告警；
+2. ``late_day_arrives``：补报 2026-11-18 = 300，低于基准中位数一半，
+   再新增一条告警；
+3. ``backfill_old_day``：补报旧日 2026-10-21 = 100，后续日期基准改变，
+   2026-11-18 不再满足告警条件而解除；
+4. ``withdraw_old_day``：撤回 2026-10-21（置 null），基准复原，
+   2026-11-18 重新告警。
+"""
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Literal
 
 from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
 
-# 示例数据（行列序号均从 0 开始，与请求中的矩阵下标一致）---------------
+# ---------------------------------------------------------------------------
+# Swagger 样例（请按 1 → 2 → 3 → 4 的顺序在同一院区上提交）
+# ---------------------------------------------------------------------------
 
-# 示例 1：3x3，4 个隐藏格构成自由块，取值为区间，不可还原。
-EX_RANGE: dict = {
-    "matrix": [
-        [5, None, None],
-        [None, 3, None],
-        [None, None, 2],
+EX_BATCH_INITIAL: dict = {
+    "campus": "院区A",
+    "entries": [
+        {"sample_date": "2026-09-30", "row_count": 1000},
+        {"sample_date": "2026-10-07", "row_count": 980},
+        {"sample_date": "2026-10-14", "row_count": 1020},
+        {"sample_date": "2026-10-28", "row_count": 960},
+        {"sample_date": "2026-11-04", "row_count": 1010},
+        {"sample_date": "2026-11-11", "row_count": 90},
+        # 11-18 尚未收齐：填 null，不参与任何基准
+        {"sample_date": "2026-11-18", "row_count": None},
     ],
-    "row_totals": [12, 10, 8],
-    "col_totals": [9, 9, 12],
 }
 
-# 示例 2：3x3，隐藏格被合计完全锁定，全部可还原。
-EX_RECOVERABLE: dict = {
-    "matrix": [
-        [2, None, 3],
-        [None, 4, None],
-        [5, 1, None],
+EX_BATCH_LATE_DAY: dict = {
+    "campus": "院区A",
+    "entries": [
+        # 11-18 收齐：最近 4 个同星期几已收齐日为
+        # 11-11(90)、11-04(1010)、10-28(960)、10-14(1020)，
+        # 中位数 985，一半 492.5；300 < 492.5 → 新增告警
+        {"sample_date": "2026-11-18", "row_count": 300}
     ],
-    "row_totals": [10, 10, 9],
-    "col_totals": [9, 10, 10],
 }
 
-# 示例 3：行合计之和与列合计之和不相等，直接冲突。
-EX_TOTAL_CONFLICT: dict = {
-    "matrix": [
-        [1, None],
-        [None, 2],
+EX_BACKFILL_OLD_DAY: dict = {
+    "campus": "院区A",
+    "entries": [
+        # 补报旧日：10-21 进入 11-18 的最近 4 个基准，
+        # 新基准 [90, 100, 960, 1010] 中位数 530，一半 265；
+        # 300 不再低于 265 → 11-18 告警解除（11-11 仍告警）
+        {"sample_date": "2026-10-21", "row_count": 100}
     ],
-    "row_totals": [5, 5],
-    "col_totals": [6, 6],
 }
 
-# 示例 4：总量相等但运输结构无解（第 0 行只能把量送进第 0 列，容量不够）。
-EX_HALL_CONFLICT: dict = {
-    "matrix": [
-        [None, 4],
-        [3, None],
+EX_WITHDRAW_OLD_DAY: dict = {
+    "campus": "院区A",
+    "entries": [
+        # 撤回：10-21 重新置为未收齐（null），后续基准复原，
+        # 11-18 重新满足告警条件 → 再次新增告警
+        {"sample_date": "2026-10-21", "row_count": None}
     ],
-    "row_totals": [10, 7],
-    "col_totals": [5, 12],
 }
 
 
-class SuppressionRequest(BaseModel):
-    """核查请求：计数矩阵（null 表示遮盖格）与公开行/列合计。"""
+# ---------------------------------------------------------------------------
+# 请求模型
+# ---------------------------------------------------------------------------
 
-    matrix: list[list[StrictInt | None]] = Field(
+class DailyCountEntry(BaseModel):
+    """单个采样日的入仓行数。"""
+
+    sample_date: date = Field(..., description="采样日（ISO 8601，如 2026-11-11）")
+    row_count: StrictInt | None = Field(
         ...,
         description=(
-            "最多 12x12 的非负整数计数矩阵；null 表示被遮盖的格子，"
-            "其余数值视为已公开的固定格"
+            "当日入仓行数，非负整数；null 表示该采样日尚未收齐，"
+            "收齐但无记录请显式填 0"
         ),
     )
-    row_totals: list[StrictInt] = Field(
-        ..., description="每一行的公开合计，长度须等于矩阵行数"
-    )
-    col_totals: list[StrictInt] = Field(
-        ..., description="每一列的公开合计，长度须等于矩阵列数"
-    )
 
-    @field_validator("matrix")
+    @field_validator("row_count")
     @classmethod
-    def _validate_matrix_cells(cls, value):
-        # StrictInt 在联合类型里仍可能放行 bool（bool 是 int 子类），显式拒绝；
-        # 同时统一拦截负数
-        for i, row in enumerate(value):
-            for j, cell in enumerate(row):
-                if isinstance(cell, bool):
-                    raise ValueError(
-                        f"matrix[{i}][{j}] 不能是布尔值，须为整数或 null"
-                    )
-                if cell is not None and cell < 0:
-                    raise ValueError(f"matrix[{i}][{j}] 不能为负数：{cell}")
+    def _reject_bool_and_negative(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("row_count 不能是布尔值，须为非负整数或 null")
+        if value is not None and value < 0:
+            raise ValueError(f"row_count 不能为负数：{value}")
         return value
 
-    @field_validator("row_totals", "col_totals")
+
+class BatchSubmitRequest(BaseModel):
+    """一批提交：一个院区、若干采样日；同批日期不得重复。"""
+
+    campus: str = Field(..., min_length=1, description="院区标识，去除首尾空白后不能为空")
+    entries: list[DailyCountEntry] = Field(
+        ..., min_length=1, description="本批采样日行数；同一天的新数据覆盖旧值"
+    )
+
+    @field_validator("campus")
     @classmethod
-    def _validate_totals(cls, value):
-        for i, cell in enumerate(value):
-            if isinstance(cell, bool):
-                raise ValueError(f"合计值不能是布尔值：位置 {i}")
-            if cell < 0:
-                raise ValueError(f"合计值不能为负数：位置 {i} = {cell}")
+    def _strip_campus(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("campus 不能为空白字符串")
         return value
 
     @model_validator(mode="after")
-    def _check_shape(self) -> "SuppressionRequest":
-        if not self.matrix:
-            raise ValueError("matrix 至少要包含一行")
-        if len(self.matrix) > 12:
-            raise ValueError("matrix 行数不能超过 12")
-        width = len(self.matrix[0])
-        if width == 0 or width > 12:
-            raise ValueError("matrix 列数须在 1..12 之间")
-        for i, row in enumerate(self.matrix):
-            if len(row) != width:
-                raise ValueError(f"第 {i} 行长度与首行不一致（应为 {width}）")
-        if len(self.row_totals) != len(self.matrix):
-            raise ValueError("row_totals 长度须等于矩阵行数")
-        if len(self.col_totals) != width:
-            raise ValueError("col_totals 长度须等于矩阵列数")
-        if any(v < 0 for v in self.row_totals):
-            raise ValueError("row_totals 不能包含负数")
-        if any(v < 0 for v in self.col_totals):
-            raise ValueError("col_totals 不能包含负数")
+    def _check_unique_dates(self) -> "BatchSubmitRequest":
+        days = [entry.sample_date for entry in self.entries]
+        if len(days) != len(set(days)):
+            raise ValueError("同批提交中 sample_date 不能重复")
         return self
 
-    model_config = {
-        "json_schema_extra": {
-            "examples": [
-                {"summary": "可行：隐藏格存在取值区间（不可还原）", "value": EX_RANGE},
-                {"summary": "可行：隐藏格被合计唯一锁定（可还原）", "value": EX_RECOVERABLE},
-                {"summary": "冲突：行列总合计不相等", "value": EX_TOTAL_CONFLICT},
-                {"summary": "冲突：总量相等但结构无解（Hall 条件）", "value": EX_HALL_CONFLICT},
-            ]
-        }
-    }
+
+# ---------------------------------------------------------------------------
+# 响应模型
+# ---------------------------------------------------------------------------
+
+class BaselinePointModel(BaseModel):
+    sample_date: date = Field(..., description="基准采样日")
+    row_count: int = Field(..., description="该基准日的入仓行数")
 
 
-class Dimensions(BaseModel):
-    rows: int
-    cols: int
-
-
-class CellRange(BaseModel):
-    row: int = Field(..., description="隐藏格行下标（从 0 开始）")
-    col: int = Field(..., description="隐藏格列下标（从 0 开始）")
-    min: int = Field(..., description="在全部合计同时成立前提下该格的最小取值")
-    max: int = Field(..., description="在全部合计同时成立前提下该格的最大取值")
-    recoverable: bool = Field(
-        ..., description="min == max 时为 true，表示可被公开合计精确反推"
+class RaisedAlert(BaseModel):
+    sample_date: date = Field(..., description="新增告警的采样日")
+    row_count: int = Field(..., description="该采样日的入仓行数")
+    median: int | float = Field(
+        ..., description="4 个基准行数的中位数（奇数和时为 x.5）"
+    )
+    baseline: list[BaselinePointModel] = Field(
+        ..., description="基准日期及对应行数，按日期升序，恰好 4 个"
     )
 
 
-class FeasibleResponse(BaseModel):
-    status: Literal["feasible"]
-    dimensions: Dimensions
-    grand_total: int = Field(..., description="行合计之和（等于列合计之和）")
-    hidden_count: int
-    recoverable_count: int = Field(..., description="可还原隐藏格数量")
-    cells: list[CellRange] = Field(
-        ..., description="每个隐藏格的取值区间与可还原标记，按行优先顺序"
+class ResolvedAlert(BaseModel):
+    sample_date: date = Field(..., description="本批解除告警的采样日")
+
+
+class ActiveAlertDate(BaseModel):
+    sample_date: date
+
+
+class BatchSubmitResponse(BaseModel):
+    campus: str
+    received: int = Field(..., description="本批实际写入的采样日条数")
+    raised: list[RaisedAlert] = Field(
+        ..., description="本批新增告警（提交前不存在、提交后有效）"
     )
-    minimizer_matrix: list[list[int]] = Field(
-        ..., description="达到各隐藏格下界的完整可行矩阵（对首个隐藏格取 min）"
+    resolved: list[ResolvedAlert] = Field(
+        ..., description="本批解除告警（提交前有效、提交后不再成立）"
     )
-    maximizer_matrix: list[list[int]] = Field(
-        ..., description="达到各隐藏格上界的完整可行矩阵（对首个隐藏格取 max）"
+    active_alerts: list[ActiveAlertDate] = Field(
+        ..., description="提交后本院区全部有效告警日期，按日期升序"
     )
 
 
-class ConflictWitness(BaseModel):
-    max_flow: int
-    required_flow: int
-    row_subset: list[int] = Field(
-        ..., description="最小割源侧的行下标集合 R（0 起）"
-    )
-    neighbor_cols: list[int] = Field(
-        ..., description="与 R 中隐藏格相邻的列下标集合 N(R)"
-    )
-    subset_demand: int = Field(..., description="行子集 R 的隐藏格总需求")
-    neighbor_supply: int = Field(
-        ..., description="邻接列 N(R) 能承接的总供给，小于需求即无解"
-    )
+class DailyCountView(BaseModel):
+    sample_date: date
+    weekday: int = Field(..., description="星期几（0=周一 … 6=周日）")
+    row_count: int | None = Field(..., description="null 表示尚未收齐")
+    updated_at: str
 
 
-class ConflictResponse(BaseModel):
-    status: Literal["conflict"]
-    reasons: list[str] = Field(
-        ..., description="冲突的文字说明；无解时不返回任何取值区间"
-    )
-    witness: ConflictWitness | None = Field(
-        default=None, description="最大流最小割给出的 Hall 型冲突见证（若适用）"
-    )
+class AlertView(BaseModel):
+    sample_date: date
+    weekday: int
+    row_count: int
+    median: int | float
+    baseline: list[BaselinePointModel]
+    triggered_at: str
 
 
 class HealthResponse(BaseModel):

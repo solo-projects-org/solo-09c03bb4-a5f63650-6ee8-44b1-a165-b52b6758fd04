@@ -1,10 +1,15 @@
 services:
-  suppression-check:
+  daily-volume-alert:
     build: .
-    image: suppression-check:1.0.0
-    container_name: suppression-check
+    image: daily-volume-alert:1.0.0
+    container_name: daily-volume-alert
     ports:
       - "8000:8000"
+    environment:
+      # SQLite 数据库文件位置；挂载到命名卷以持久化日量与告警状态
+      DAILY_ALERT_DB: /data/daily_alert.db
+    volumes:
+      - alert-data:/data
     restart: unless-stopped
     healthcheck:
       test:
@@ -16,3 +21,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+volumes:
+  alert-data:

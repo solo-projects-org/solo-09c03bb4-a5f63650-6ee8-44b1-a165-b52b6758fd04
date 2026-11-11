@@ -13,9 +13,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-# 以非 root 用户运行
+# 以非 root 用户运行，并预置数据目录（由 compose 命名卷挂载覆盖）
 RUN useradd --create-home --uid 10001 appuser \
-    && chown -R appuser:appuser /app
+    && mkdir -p /data \
+    && chown -R appuser:appuser /app /data
 USER appuser
 
 EXPOSE 8000
